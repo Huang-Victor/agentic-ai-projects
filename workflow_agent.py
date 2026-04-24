@@ -350,7 +350,7 @@ def run_workflow(question: str) -> str:
 # Step 7: Run it
 if __name__ == "__main__":
     answer = run_workflow(
-        "What are the pros and cons of living in NYC vs SF for a software engineer?"
+        "How close are we to AGI? Who are the major AGI research players and how far along are they?"
     )
     print(f"\n{'='*60}")
     print("FINAL ANSWER")
