@@ -4,10 +4,13 @@ from dotenv import load_dotenv
 from anthropic import Anthropic
 from ddgs import DDGS
 from typing import TypedDict
+from notion_client import Client
 
 load_dotenv()
 
 client = Anthropic()
+notion = Client(auth=os.environ["NOTION_API_KEY"])
+NOTION_PAGE_ID = os.environ["NOTION_PAGE_ID"]
 ddgs = DDGS()
 
 # Step 1: Define the state (what data flows through the whole workflow)
@@ -171,6 +174,145 @@ def writer_node(state: ResearchState) -> ResearchState:
 
     return state
 
+# Step 6a: Human-in-the-loop checkpoint
+def human_approval_node(state: ResearchState) -> ResearchState:
+    """Pause and let the human review, edit, or abort the planned queries."""
+    print(f"\n--- HUMAN CHECKPOINT ---")
+    print(f"The planner generatedthe following {len(state['queries'])} queries:")
+    print()
+    for i, query in enumerate(state['queries'], 1):
+        print(f"  {i}. {query}")
+    
+    print()
+    print("Options:")
+    print("  [enter]     Accept all queries and continue")
+    print("  [abort]     Stop the workflow entirely")
+    print("  [remove X]  Remove query number X (e.g. 'remove 3')")
+    print("  [edit X]    Edit query number X (e.g. 'edit 2')")
+    print("  [add]       Add a new query")
+    print()
+
+    while True:
+        user_input = input("Your choice: ").strip().lower()
+        
+        if user_input == "":
+            # Accept all and continue
+            print("Queries approved. Continuing workflow...")
+            break
+        
+        elif user_input =="abort":
+            print("Workflow aborted by user.")
+            raise SystemExit(0)
+        
+        elif user_input.startswith("remove "):
+            try:
+                index = int(user_input.split(" ")[1]) - 1
+                if 0 <= index < len(state['queries']):
+                    removed = state['queries'].pop(index)
+                    print(f"Removed: '{removed}'")
+                    print(f"Remaining queries:")
+                    for i, q in enumerate(state['queries'], 1):
+                        print(f"  {i}. {q}")
+                else:
+                    print(f"Invalid number. Choose between 1 and {len(state['queries'])}")
+            except ValueError:
+                print("Invalid format. Use 'remove X' where X is a number.")
+
+        elif user_input.startswith("edit "):
+            try:
+                index = int(user_input.split(" ")[1]) - 1
+                if 0 <= index < len(state['queries']):
+                    print(f"Current query: '{state['queries'][index]}'")
+                    new_query = input("New query: ").strip()
+                    if new_query:
+                        state['queries'][index] = new_query
+                        print(f"Updated to: '{new_query}'")
+                else:
+                    print(f"Invalid number. Choose between 1 and {len(state['queries'])}")
+            except ValueError:
+                print("Invalid format. Use 'edit X' where X is a number.")
+
+        elif user_input == "add":
+            new_query = input("New query: ").strip()
+            if new_query:
+                state['queries'].append(new_query)
+                print(f"Added: '{new_query}'")
+                print(f"Current queries:")
+                for i, q in enumerate(state['queries'], 1):
+                    print(f" {i}. {q}")
+
+        else:
+            print("Unrecognized option. Try [enter], [abort], [remove X], [edit X], or [add].")
+
+    print(f"\nFinal queriesgoing to researcher: {len(state['queries'])}")
+    for i, q in enumerate(state['queries'], 1):
+        print(f"  {i}. {q}")
+
+    return state
+
+# Step 6b: Add to Notion Page
+
+def notion_writer_node(state: ResearchState) -> ResearchState:
+    """Write the final answer to a Notion page."""
+    print(f"\n--- NOTION WRITER ---")
+
+    # The Notion API builds pages from "blocks"
+    # We'll create a title block and then convert the answer into paragraph blocks
+
+    # Split the answer into chunks - Notion has a 2000 character limit per block
+    answer = state['final_answer']
+    chunks = [answer[i:i+1900] for i in range(0, len(answer), 1900)]
+
+    # Build the block content
+    children = []
+
+    # Add a divider to separate entries
+    children.append({"object": "block", "type": "divider", "divider": {}})
+
+    # Add the question asa heading
+    children.append({
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": f"Q: {state['question']}"}}]
+        }
+    })
+
+    # Add metadata callout
+    children.append({
+        "object": "block",
+        "type": "callout",
+        "callout": {
+            "rich_text": [{"type": "text", "text": {
+                "content": f"Queries executed: {state['turn_count']} | Research {len(state['findings'])} chars"
+            }}],
+            "icon": {"emoji": "🔍"}
+        }
+    })
+
+    # Add the answer in the paragraph chunks
+    for chunk in chunks:
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": chunk}}]
+            }
+        })
+
+        # Append all blocks to the page
+        notion.blocks.children.append(
+            block_id=NOTION_PAGE_ID,
+            children=children
+        )
+
+        print(f"Successfully wrote to Notion page!")
+        print(f"  Question: {state['question'][:60]}...")
+        print(f"  Answer length: {len(answer)} characters")
+        print(f"  Blocks written: {len(children)}")
+
+        return state
+
 # Step 6: Define the workflow (connect the nodes in order)
 
 def run_workflow(question: str) -> str:
@@ -178,8 +320,7 @@ def run_workflow(question: str) -> str:
     print(f"\n{'='*60}")
     print(f"RESEARCH WORKFLOW")
     print(f"{'='*60}")
-
-    # Initialize state
+    
     state: ResearchState = {
         "question": question,
         "queries": [],
@@ -188,13 +329,14 @@ def run_workflow(question: str) -> str:
         "final_answer": "",
         "turn_count": 0
     }
-
-    # Run nodes in sequence
+    
     state = planner_node(state)
+    state = human_approval_node(state)  # <- checkpoint here
     state = researcher_node(state)
     state = synthesizer_node(state)
     state = writer_node(state)
-
+    state = notion_writer_node(state)  # <- new final step
+    
     print(f"\n{'='*60}")
     print(f"WORKFLOW COMPLETE")
     print(f"  Queries executed: {state['turn_count']}")
