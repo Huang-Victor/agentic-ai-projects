@@ -393,7 +393,76 @@ def enrich_column_profile_with_llm(profile: ColumnProfile) -> dict:
         "suspicious_values": [],
     }
 
+def schema_and_mapping_node(state: MigrationState) -> MigrationState:
+    """Build the proposed Notion schema and CSV-to-property mapping from the profile."""
+    print(f"\n--- SCHEMA AND MAPPING PROPOSAL ---")
 
+    schema: list[NotionProperty] = []
+    mapping: list[MappingEntry] = []
+
+    for column_profile in state["profile"]:
+        notion_property = build_property_from_profile(column_profile)
+        mapping_entry = build_mapping_from_profile(column_profile, notion_property["name"])
+
+        schema.append(notion_property)
+        mapping.append(mapping_entry)
+
+    state["pre_edit_schema"] = schema
+    state["pre_edit_mapping"] = mapping
+    return state
+
+def build_property_from_profile(column_profile: ColumnProfile) -> NotionProperty:
+    """Turn one ColumnProfile into one NotionProperty."""
+
+    # 1. Prettify the name: due_date -> Due Date
+    property_name = column_profile["column_name"].replace("_", " ").title()
+
+    # 2. Type comes straight from Phase 2's inferred_type
+    property_type = column_profile["inferred_type"]
+
+    # 3. Options apply only to select / multi_select
+    if property_type in {"select", "multi_select"}:
+        suspicious_value_strings = {
+            sv["value"] for sv in column_profile["suspicious_values"]
+        }
+        distinct_values = set(column_profile["distinct_values_sample"])
+        canonical_options = sorted(distinct_values - suspicious_value_strings)
+        options: list[str] | None = canonical_options
+    else:
+        options = None
+
+    # 4. Confidence rating, derived from the profile
+    if property_type == "unknown":
+        confidence = "low"
+    elif len(column_profile["suspicious_values"]) > 0:
+        confidence = "medium"
+    else:
+        confidence = "high"
+
+    return {
+        "name": property_name,
+        "type": property_type,
+        "options": options,
+        "confidence": confidence,
+    }
+
+
+def build_mapping_from_profile(column_profile: ColumnProfile, property_name: str) -> MappingEntry:
+    """Map a CSV column to its Notion property."""
+
+    # Mirror confidence from the schema's own logic.
+    if column_profile["inferred_type"] == "unknown":
+        confidence = "low"
+    elif len(column_profile["suspicious_values"]) > 0:
+        confidence = "medium"
+    else:
+        confidence = "high"
+
+    return {
+        "csv_column": column_profile["column_name"],
+        "notion_property": property_name,
+        "confidence": confidence,
+    }
 
 if __name__ == "__main__":
     state = init_state(
@@ -401,12 +470,16 @@ if __name__ == "__main__":
         parent_id="34cb6cf3b46980c9ab00d8896467fa30",
     )
     state = structural_validation_node(state)
-    
+
     if state["structural_validation_result"]["valid"]:
         state = profile_node(state)
+        state = schema_and_mapping_node(state)
+
         from pprint import pp
-        print("\nProfile:")
-        pp(state["profile"])
+        print("\nSchema proposal:")
+        pp(state["pre_edit_schema"])
+        print("\nMapping proposal:")
+        pp(state["pre_edit_mapping"])
     else:
         print("\nValidation failed; skipping profile.")
         for msg in state["structural_validation_result"]["error_messages"]:
