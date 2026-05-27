@@ -6,6 +6,8 @@ import os
 from dateutil.parser import parse as parse_date
 from anthropic import Anthropic
 from dotenv import load_dotenv
+import shlex
+
 
 load_dotenv()
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -464,23 +466,323 @@ def build_mapping_from_profile(column_profile: ColumnProfile, property_name: str
         "confidence": confidence,
     }
 
+def human_checkpoint_node(state: MigrationState) -> MigrationState:
+    """First human checkpoint. Human reviews and edits schema + mapping proposals."""
+    print(f"\n--- HUMAN CHECKPOINT 1 ---")
+
+    # Work on copies of the proposals - preserve the originials for audit. 
+    working_schema: list[NotionProperty] = [dict(p) for p in state["pre_edit_schema"]]
+    working_mapping: list[MappingEntry] = [dict(m) for m in state["pre_edit_mapping"]]
+
+    print_checkpoint_context(state["profile"], working_schema, working_mapping)
+    print_command_help()
+
+    while True:
+        try:
+            raw_input = input("\n> ").strip()
+        except EOFError:
+            # Stdin closed (rare in interactive use). Treat as abort).
+            print("Input stream closed. Aborting.")
+            state["rejection_return_stage"] = "human_checkpoint_1"
+            return state
+        
+        if not raw_input:
+            continue
+
+        try:
+            tokens = shlex.split(raw_input)
+        except ValueError as e:
+            print(f"Couldn't parse input: {e}")
+            continue
+
+        command = tokens[0].lower()
+        args = tokens[1:]
+
+        if command == "enter":
+            state["post_edit_schema"] = working_schema
+            state["post_edit_mapping"] = working_mapping
+            print("Approved. Continuing pipeline.")
+            return state
+        
+        elif command == "abort":
+            print("Aborting run.")
+            state["rejection_return_stage"] = "human_checkpoint_1"
+            return state
+        
+        elif command == "help":
+            print_command_help()
+
+        elif command == "preview":
+            print_working_state(working_schema, working_mapping)
+
+        elif command == "remove":
+            apply_remove(args, working_schema, working_mapping, state)
+
+        elif command == "add":
+            apply_add(args, working_schema, state)
+
+        elif command == "edit_type":
+            apply_edit_type(args, working_schema, state)
+
+        elif command == "edit_options":
+            apply_edit_options(args, working_schema, state)
+
+        elif command == "edit_mapping":
+            apply_edit_mapping(args, working_schema, working_mapping, state)
+
+        elif command == "remove_mapping":
+            apply_remove_mapping(args, working_mapping, state)
+
+        else:
+            print(f"Unknown command: {command!r}. Type 'help' for a list.")
+
+def print_checkpoint_context(
+        profile: list[ColumnProfile],
+        schema: list[NotionProperty],
+        mapping: list[MappingEntry],
+) -> None:
+    """Show the human what they're reviewing."""
+    from pprint import pp
+    print("\nProfile (evidence):")
+    pp(profile)
+    print("\nProposed schema:")
+    pp(schema)
+    print("\nProposed mapping:")
+    pp(mapping)
+
+def print_working_state(
+        schema: list[NotionProperty],
+        mapping: list[MappingEntry],
+) -> None:
+    """Show the current state of the working copies."""
+    from pprint import pp
+    print("\nCurrent working schema:")
+    pp(schema)
+    print("\nCurrent working mapping:")
+    pp(mapping)
+
+def print_command_help() -> None:
+    print("""
+Available commands:
+  preview                                       — show current working schema and mapping
+  enter                                         — approve and continue
+  abort                                         — discard and halt run
+  remove <property_name>                        — remove a property (use quotes if name contains spaces)
+  add <property_name> <type>                    — add a new property
+  edit_type <property_name> <new_type>          — change a property's type
+  edit_options <property_name> <opt1,opt2,...>  — set select options
+  edit_mapping <csv_column> <property_name>     — change which property a CSV column maps to
+  remove_mapping <csv_column>                   — drop a mapping (property stays)
+  help                                          — print this list
+""")
+    
+def find_property(name: str, schema: list[NotionProperty]) -> NotionProperty | None: 
+    """Look up a property by display name. Case-insensitive."""
+    for prop in schema:
+        if prop["name"].lower() == name.lower():
+            return prop
+    return None
+
+def record_edit(
+        state: MigrationState,
+        action: str,
+        target: str,
+        details: dict[str, Any],
+) -> None:
+    """Append an EditAction record to edit_history."""
+    state["edit_history"].append({
+        "action": action,
+        "target": target,
+        "details": details,
+        "timestamp": datetime.now().isoformat(),
+    })
+
+def apply_remove(
+        args: list[str],
+        schema: list[NotionProperty],
+        mapping: list[MappingEntry],
+        satate: MigrationState,
+) -> None:
+    if len(args) != 1:
+        print("Usage: remove <property_name>")
+        return
+    
+    name = args[0]
+    prop = find_property(name, schema)
+    if prop is None:
+        print(f"No property named {name!r}.")
+        return
+    
+    # Remove the property.
+    schema.remove(prop)
+    print(f"Removed property {prop['name']!r}.")
+
+    # Cascade: remove any mappings that pointed at this property.
+    cascaded = [m for m in mapping if m["notion_property"].lower() == prop["name"].lower()]
+    for m in cascaded:
+        mapping.remove(m)
+        print(f"  Also removed mapping: {m['csv_column']!r} → {m['notion_property']!r}.")
+
+    record_edit(state, "remove_property", prop["name"], {
+        "cascaded_mappings_removed": [m["csv_column"] for m in cascaded],
+    })
+
+def apply_add(
+        args: list[str],
+        schema: list[NotionProperty],
+        state: MigrationState, 
+) -> None:
+    if len(args) != 2:
+        print("Usage: add <property_name> <type>")
+        return
+    
+    name, prop_type = args
+    if find_property(name, schema) is not None:
+        print(f"Property {name!r} already exists.")
+        return
+    
+    new_prop: NotionProperty = {
+        "name": name,
+        "type": prop_type,
+        "options": None,
+        "confidence": "low", # human-added properties start at low confidence - no profile backing
+    }
+    schema.append(new_prop)
+    print(f"Added property {name!r} of type {prop_type!r}.")
+    record_edit(state, "add_property", name, {"type": prop_type})
+
+def apply_edit_type(
+        args: list[str],
+        schema: list[NotionProperty],
+        state: MigrationState,
+) -> None:
+    if len(args) != 2:
+        print("Usage: edit_type <property_name> <new_type>")
+        return
+    
+    name, new_type = args
+    prop = find_property(name, schema)
+    if prop is None:
+        print(f"No property named {name!r}.")
+        return
+    
+    old_type = prop["type"]
+    prop["type"] = new_type
+    # If changing away from select/multi_select, options no longer apply.
+    if new_type not in {"select", "multi_select"}:
+        prop["options"] = None
+    print(f"Changed type of {name!r}: {old_type} -> {new_type}.")
+    record_edit(state, "edit_type", name, {"old_type": old_type, "new_type": new_type})
+
+def apply_edit_options(
+        args: list[str],
+        schema: list[NotionProperty],
+        state: MigrationState,
+) -> None:
+    if len(args) != 2:
+        print("Usage: edit_options <property_name> <opt1,opt2,opt3>")
+        return 
+    
+    name, options_csv = args
+    prop = find_property(name, schema)
+    if prop is None:
+        print(f"No property named {name!r}.")
+        return
+    
+    if prop["type"] not in {"select", "multi_select"}:
+        print(f"Property {name!r} is type {prop['type']!r}; options only apply to select/multi_select.")
+        return
+    
+    new_options = [opt.strip() for opt in options_csv.split(",") if opt.strip()]
+    old_options = prop["options"]
+    prop["options"] = new_options
+    print(f"Changed options of {name!r}: {old_options} -> {new_options}.")
+    record_edit(state, "edit_options", name, {"old_options": old_options, "new_options": new_options})
+
+def apply_edit_mapping(
+        args: list[str],
+        schema: list[NotionProperty],
+        mapping: list[MappingEntry],
+        state: MigrationState,
+) -> None:
+    if len(args) != 2:
+        print("Usage: edit_mapping <csv_column> <property_name>")
+        return   
+
+    csv_column, prop_name = args
+
+    # The target property must exist.
+    prop = find_property(prop_name, schema) 
+    if prop is None:
+        print(f"No property named {prop_name!r} to map to.")
+        return
+
+    # Find the mapping entry for this csv_column, or create one.
+    existing = next((m for m in mapping if m["csv_column"].lower() == csv_column.lower()), None)
+    if existing is None:
+        new_mapping: MappingEntry = {
+            "csv_column": csv_column,
+            "notion_property": prop["name"],
+            "confidence": "low" # human-set mappings start at low confidence
+        }   
+        mapping.append(new_mapping)
+        print(f"Created mapping: {csv_column!r} -> {prop['name']!r}.")
+        record_edit(state, "create_mapping", csv_column, {"notion_property": prop["name"]})
+    else:
+        old_target = existing["notion_property"]
+        existing["notion_property"] = prop["name"]
+        print(f"Changed mapping of {csv_column!r}: {old_target!r} -> {prop['name']!r}.")
+        record_edit(state, "edit_mapping", csv_column, {
+            "old_property": old_target,
+            "new_property": prop["name"],
+        })
+
+def apply_remove_mapping(
+    args: list[str],
+    mapping: list[MappingEntry],
+    state: MigrationState,
+) -> None:
+    if len(args) != 1:
+        print("Usage: remove_mapping <csv_column>")
+        return
+
+    csv_column = args[0]
+    existing = next((m for m in mapping if m["csv_column"].lower() == csv_column.lower()), None)
+    if existing is None:
+        print(f"No mapping found for CSV column {csv_column!r}.")
+        return
+
+    mapping.remove(existing)
+    print(f"Removed mapping: {csv_column!r} → {existing['notion_property']!r}.")
+    record_edit(state, "remove_mapping", csv_column, {
+        "previous_property": existing["notion_property"],
+    })
+
+
+
 if __name__ == "__main__":
     state = init_state(
-        csv_path="Test Files/stress_test_2.csv",
+        csv_path="Test Files/stress_test_1.csv",
         parent_id="34cb6cf3b46980c9ab00d8896467fa30",
     )
     state = structural_validation_node(state)
 
-    if state["structural_validation_result"]["valid"]:
-        state = profile_node(state)
-        state = schema_and_mapping_node(state)
-
-        from pprint import pp
-        print("\nSchema proposal:")
-        pp(state["pre_edit_schema"])
-        print("\nMapping proposal:")
-        pp(state["pre_edit_mapping"])
-    else:
-        print("\nValidation failed; skipping profile.")
+    if not state["structural_validation_result"]["valid"]:
+        print("\nValidation failed; halting.")
         for msg in state["structural_validation_result"]["error_messages"]:
             print(f"  - {msg}")
+    else:
+        state = profile_node(state)
+        state = schema_and_mapping_node(state)
+        state = human_checkpoint_node(state)
+
+        if state["rejection_return_stage"] is not None:
+            print(f"\nRun halted at: {state['rejection_return_stage']}.")
+        else:
+            print("\nPost-edit schema:")
+            from pprint import pp
+            pp(state["post_edit_schema"])
+            print("\nPost-edit mapping:")
+            pp(state["post_edit_mapping"])
+            print("\nEdit history:")
+            pp(state["edit_history"])
