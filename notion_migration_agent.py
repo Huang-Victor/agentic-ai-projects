@@ -57,7 +57,7 @@ class ColumnCoercionResult(TypedDict):
     target_type: str
     success_count: int
     failure_count: int
-    failure_examples: list[str]
+    failure_examples: list[CoercionFailure]  # was list[str]
 
 
 class SampleSelection(TypedDict):
@@ -81,6 +81,12 @@ class ReconciliationReport(TypedDict):
     failed_row_indices: list[int]
 
 
+class CoercionFailure(TypedDict):
+    row_index: int
+    value: str
+    reason: str
+
+
 class MigrationState(TypedDict):
     run_id: str
     source_csv_path: str
@@ -100,6 +106,7 @@ class MigrationState(TypedDict):
     bulk_row_outcomes: list[RowOutcome]
     rejection_return_stage: str | None
     reconciliation_report: ReconciliationReport | None
+
 
 def init_state(csv_path: str, parent_id: str) -> MigrationState:
     return {
@@ -758,6 +765,243 @@ def apply_remove_mapping(
         "previous_property": existing["notion_property"],
     })
 
+# Coercion failure threshold for halting the run.
+# Per-column failure rate above this triggers rejection back to the checkpoint.
+# TODO: move to configuration, per-deployment tunable.
+COERCION_FAILURE_THRESHOLD = 0.05  # 5%
+
+
+def coercion_preview_node(state: MigrationState) -> MigrationState:
+    """Simulate type coercion for each mapped property against the CSV data.
+    
+    Produces a coercion report. If any column's failure rate exceeds the
+    threshold, routes the run back to the checkpoint with the report attached
+    so the human can fix the schema with evidence in hand.
+    """
+    print(f"\n--- COERCION PREVIEW ---")
+
+    # Load the CSV. Already known to be structurally valid.
+    with open(state["source_csv_path"], "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # Build a quick lookup of column name -> column index.
+    col_index_by_name = {name: i for i, name in enumerate(header)}
+
+    coercion_report: list[ColumnCoercionResult] = []
+    any_over_threshold = False
+
+    # For each mapped property, find its source column and run coercion.
+    for mapping_entry in state["post_edit_mapping"]:
+        csv_column = mapping_entry["csv_column"]
+        property_name = mapping_entry["notion_property"]
+
+        # Find the property in the post-edit schema.
+        notion_property = next(
+            (p for p in state["post_edit_schema"] if p["name"] == property_name),
+            None,
+        )
+        if notion_property is None:
+            # Mapping points at a property that doesn't exist (collective-validity issue).
+            # We could catch this here but the architecture says checkpoint should.
+            # For now, skip — sample write will surface it cleanly.
+            continue
+
+        # Find the source CSV column index.
+        col_index = col_index_by_name.get(csv_column)
+        if col_index is None:
+            # Mapping points at a CSV column that doesn't exist in the source.
+            # Same as above — skip, surface later.
+            continue
+
+        column_values = [row[col_index] for row in data_rows]
+        target_type = notion_property["type"]
+        options = notion_property.get("options")
+
+        result = coerce_column(
+            column_values=column_values,
+            target_type=target_type,
+            options=options,
+            property_name=property_name,
+        )
+        coercion_report.append(result)
+
+        # Check threshold on this column.
+        if result["success_count"] + result["failure_count"] > 0:
+            failure_rate = result["failure_count"] / (
+                result["success_count"] + result["failure_count"]
+            )
+            if failure_rate > COERCION_FAILURE_THRESHOLD:
+                any_over_threshold = True
+
+    state["coercion_report"] = coercion_report
+
+    if any_over_threshold:
+        print("\nCoercion preview surfaced columns exceeding the failure threshold.")
+        print_coercion_report(coercion_report)
+        state["rejection_return_stage"] = "human_checkpoint_1"
+    else:
+        print("\nCoercion preview clean. Proceeding.")
+        print_coercion_report(coercion_report)
+
+    return state
+
+
+def coerce_column(
+    column_values: list[str],
+    target_type: str,
+    options: list[str] | None,
+    property_name: str,
+) -> ColumnCoercionResult:
+    """Attempt to coerce every value in a column to the target Notion type.
+    
+    Returns a ColumnCoercionResult with counts and example failures.
+    """
+    success_count = 0
+    failure_count = 0
+    failures: list[CoercionFailure] = []
+
+    for i, raw_value in enumerate(column_values, start=2):  # row 1 is header
+        # Empty cells aren't failures — Notion accepts empty values for most types.
+        # Title is the exception (handled below).
+        if not raw_value.strip():
+            if target_type == "title":
+                failures.append({
+                    "row_index": i,
+                    "value": raw_value,
+                    "reason": "title cannot be empty",
+                })
+                failure_count += 1
+            else:
+                success_count += 1
+            continue
+
+        ok, reason = try_coerce_value(raw_value, target_type, options)
+        if ok:
+            success_count += 1
+        else:
+            failure_count += 1
+            # Cap failure examples at 10 to keep state and output manageable.
+            if len(failures) < 10:
+                failures.append({
+                    "row_index": i,
+                    "value": raw_value,
+                    "reason": reason,
+                })
+
+    return {
+        "property_name": property_name,
+        "target_type": target_type,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "failure_examples": failures,
+    }
+
+
+def try_coerce_value(
+    value: str,
+    target_type: str,
+    options: list[str] | None,
+) -> tuple[bool, str]:
+    """Try to coerce one value to the target Notion type.
+    
+    Returns (success, reason_if_failed). reason is empty when success is True.
+    """
+    v = value.strip()
+
+    if target_type == "title":
+        # Already checked for empty above; any non-empty string is a valid title.
+        return True, ""
+
+    if target_type == "rich_text":
+        # Any string works.
+        return True, ""
+
+    if target_type == "select":
+        if options is None or len(options) == 0:
+            return False, "select property has no defined options"
+        if v in options:
+            return True, ""
+        return False, f"value {v!r} not in defined options {options}"
+
+    if target_type == "multi_select":
+        if options is None or len(options) == 0:
+            return False, "multi_select property has no defined options"
+        # Coerce: split on comma to allow multi-value cells; trim each item.
+        items = [item.strip() for item in v.split(",") if item.strip()]
+        if not items:
+            return False, "no valid items after splitting on comma"
+        bad_items = [item for item in items if item not in options]
+        if bad_items:
+            return False, f"items not in options: {bad_items}"
+        return True, ""
+
+    if target_type == "date":
+        try:
+            parse_date(v)
+            return True, ""
+        except (ValueError, TypeError):
+            return False, "could not parse as date"
+
+    if target_type == "number":
+        try:
+            float(v)
+            return True, ""
+        except ValueError:
+            return False, "could not parse as number"
+
+    if target_type == "checkbox":
+        if v.lower() in {"true", "false", "yes", "no", "y", "n", "0", "1"}:
+            return True, ""
+        return False, f"value {v!r} not recognizable as boolean"
+
+    if target_type == "email":
+        # Cheap heuristic: contains @ with text on both sides.
+        if "@" in v and len(v.split("@")) == 2 and all(part for part in v.split("@")):
+            return True, ""
+        return False, "value does not look like an email address"
+
+    if target_type == "url":
+        if v.startswith(("http://", "https://")):
+            return True, ""
+        return False, "url must start with http:// or https://"
+
+    if target_type == "phone_number":
+        # Cheap heuristic: contains digits, allow common separators.
+        digits = "".join(c for c in v if c.isdigit())
+        if len(digits) >= 7:
+            return True, ""
+        return False, "value does not contain enough digits to be a phone number"
+
+    # Unknown target type — treat as failure with explanatory reason.
+    return False, f"no coercion logic defined for type {target_type!r}"
+
+
+def print_coercion_report(report: list[ColumnCoercionResult]) -> None:
+    """Pretty-print the coercion report for the human."""
+    if not report:
+        print("(no columns coerced)")
+        return
+
+    for result in report:
+        total = result["success_count"] + result["failure_count"]
+        if total == 0:
+            print(f"\n  {result['property_name']} ({result['target_type']}): no data")
+            continue
+        rate = result["failure_count"] / total
+        status = "OK" if rate <= COERCION_FAILURE_THRESHOLD else "OVER THRESHOLD"
+        print(
+            f"\n  {result['property_name']} ({result['target_type']}): "
+            f"{result['success_count']}/{total} pass, "
+            f"{result['failure_count']} fail "
+            f"({rate*100:.1f}%) [{status}]"
+        )
+        for fail in result["failure_examples"][:5]:  # show up to 5 examples per column
+            print(f"    row {fail['row_index']}: {fail['value']!r} — {fail['reason']}")
+        if len(result["failure_examples"]) > 5:
+            print(f"    ... and {len(result['failure_examples']) - 5} more")
 
 
 if __name__ == "__main__":
@@ -779,10 +1023,12 @@ if __name__ == "__main__":
         if state["rejection_return_stage"] is not None:
             print(f"\nRun halted at: {state['rejection_return_stage']}.")
         else:
-            print("\nPost-edit schema:")
-            from pprint import pp
-            pp(state["post_edit_schema"])
-            print("\nPost-edit mapping:")
-            pp(state["post_edit_mapping"])
-            print("\nEdit history:")
-            pp(state["edit_history"])
+            state = coercion_preview_node(state)
+
+            if state["rejection_return_stage"] is not None:
+                print(f"\nRun halted at: {state['rejection_return_stage']}.")
+                # TODO: loop back to checkpoint with coercion report as evidence.
+            else:
+                print("\nFinal coercion report (for state inspection):")
+                from pprint import pp
+                pp(state["coercion_report"])
