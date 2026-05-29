@@ -1004,9 +1004,153 @@ def print_coercion_report(report: list[ColumnCoercionResult]) -> None:
             print(f"    ... and {len(result['failure_examples']) - 5} more")
 
 
+SAMPLE_TARGET_SIZE = 5
+
+def sample_selection_node(state: MigrationState) -> MigrationState:
+    """Choose a small set of rows to write as a sample for human in-situ review.
+    
+    Selection is informed by earlier stage artifacts — the profile (which columns
+    are messy) and the coercion report (which rows failed checks even when the
+    column passed threshold) — plus row-level patterns from the raw CSV
+    (longest content, most nulls).
+    """
+    print(f"\n--- SAMPLE SELECTION ---")
+
+    with open(state["source_csv_path"], "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    header = rows[0]
+    data_rows = rows[1:]
+    col_index_by_name = {name: i for i, name in enumerate(header)}
+
+    # Map csv_column -> set of suspicious value strings from the profile.
+    suspicious_by_column: dict[str, set[str]] = {}
+    for column_profile in state["profile"]:
+        suspicious_by_column[column_profile["column_name"]] = {
+            sv["value"] for sv in column_profile["suspicious_values"]
+        }
+
+    selected: list[SampleSelection] = []
+    selected_indices: set[int] = set()
+
+    def add_sample(row_index: int, reason: str) -> bool:
+        """Add a row to the sample if not already selected. Returns True if added."""
+        if row_index in selected_indices:
+            return False
+        if len(selected) >= SAMPLE_TARGET_SIZE:
+            return False
+        selected.append({"row_index": row_index, "selection_reason": reason})
+        selected_indices.add(row_index)
+        return True
+
+    # 1. One clean row — first row with no suspicious cells across any column.
+    for i, row in enumerate(data_rows, start=2):  # row 1 is header
+        is_clean = True
+        for col_name, suspicious_set in suspicious_by_column.items():
+            if not suspicious_set:
+                continue
+            col_idx = col_index_by_name.get(col_name)
+            if col_idx is None:
+                continue
+            if row[col_idx] in suspicious_set:
+                is_clean = False
+                break
+        if is_clean:
+            if add_sample(i, "clean row — exercises the happy path"):
+                break
+
+    # 2. Rows containing suspicious values flagged in the profile.
+    for col_name, suspicious_set in suspicious_by_column.items():
+        if not suspicious_set:
+            continue
+        col_idx = col_index_by_name.get(col_name)
+        if col_idx is None:
+            continue
+        for i, row in enumerate(data_rows, start=2):
+            if row[col_idx] in suspicious_set:
+                added = add_sample(
+                    i,
+                    f"contains suspicious value {row[col_idx]!r} in column {col_name!r}",
+                )
+                if added:
+                    break  # one per column is enough
+        if len(selected) >= SAMPLE_TARGET_SIZE:
+            break
+
+    # 3. Rows from coercion failure examples (failures that fell under threshold).
+    for result in state["coercion_report"]:
+        for failure in result["failure_examples"]:
+            add_sample(
+                failure["row_index"],
+                f"failed coercion to {result['target_type']} in property "
+                f"{result['property_name']!r}: {failure['reason']}",
+            )
+            if len(selected) >= SAMPLE_TARGET_SIZE:
+                break
+        if len(selected) >= SAMPLE_TARGET_SIZE:
+            break
+
+    # 4. Row with longest combined content — tests Notion's text limits.
+    if len(selected) < SAMPLE_TARGET_SIZE:
+        longest_row_index = -1
+        longest_length = -1
+        for i, row in enumerate(data_rows, start=2):
+            total = sum(len(cell) for cell in row)
+            if total > longest_length:
+                longest_length = total
+                longest_row_index = i
+        if longest_row_index >= 0:
+            add_sample(
+                longest_row_index,
+                f"longest combined content ({longest_length} characters) — "
+                "tests Notion's text limits",
+            )
+
+    # 5. Row with the most nulls — exercises empty-value behavior.
+    if len(selected) < SAMPLE_TARGET_SIZE:
+        most_nulls_index = -1
+        most_nulls_count = -1
+        for i, row in enumerate(data_rows, start=2):
+            nulls = sum(1 for cell in row if not cell.strip())
+            if nulls > most_nulls_count:
+                most_nulls_count = nulls
+                most_nulls_index = i
+        # Only add this sample if the row actually has nulls; otherwise it's just
+        # another clean row and we already have one.
+        if most_nulls_index >= 0 and most_nulls_count > 0:
+            add_sample(
+                most_nulls_index,
+                f"row contains {most_nulls_count} empty cell(s) — "
+                "exercises empty-value handling",
+            )
+
+    state["sample_selection"] = selected
+    print_sample_selection(selected, data_rows, header)
+    return state
+
+
+def print_sample_selection(
+    selection: list[SampleSelection],
+    data_rows: list[list[str]],
+    header: list[str],
+) -> None:
+    """Show the human which rows were chosen and why."""
+    if not selection:
+        print("(no rows selected)")
+        return
+
+    print(f"\nSelected {len(selection)} sample row(s):")
+    for item in selection:
+        # data_rows is 0-indexed; row_index in state is 1-indexed (row 2 = first data)
+        actual_row = data_rows[item["row_index"] - 2]
+        row_preview = dict(zip(header, actual_row))
+        print(f"\n  Row {item['row_index']}: {item['selection_reason']}")
+        for key, value in row_preview.items():
+            print(f"    {key}: {value!r}")
+
 if __name__ == "__main__":
     state = init_state(
-        csv_path="Test Files/stress_test_1.csv",
+        csv_path="Test Files/stress_test_2.csv",
         parent_id="34cb6cf3b46980c9ab00d8896467fa30",
     )
     state = structural_validation_node(state)
@@ -1027,8 +1171,9 @@ if __name__ == "__main__":
 
             if state["rejection_return_stage"] is not None:
                 print(f"\nRun halted at: {state['rejection_return_stage']}.")
-                # TODO: loop back to checkpoint with coercion report as evidence.
             else:
-                print("\nFinal coercion report (for state inspection):")
+                state = sample_selection_node(state)
+
+                print("\nSample selection (state):")
                 from pprint import pp
-                pp(state["coercion_report"])
+                pp(state["sample_selection"])
