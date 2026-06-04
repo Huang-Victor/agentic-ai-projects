@@ -7,10 +7,16 @@ from dateutil.parser import parse as parse_date
 from anthropic import Anthropic
 from dotenv import load_dotenv
 import shlex
+from notion_client import Client as NotionClient
+from notion_client.errors import APIResponseError, RequestTimeoutError, HTTPResponseError
 
 
 load_dotenv()
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+notion = NotionClient(
+    auth=os.getenv("NOTION_API_KEY"),
+    notion_version="2022-06-28",
+)
 
 class StructuralValidationResult(TypedDict):
     valid: bool
@@ -1148,6 +1154,304 @@ def print_sample_selection(
         for key, value in row_preview.items():
             print(f"    {key}: {value!r}")
 
+def sample_write_node(state: MigrationState) -> MigrationState:
+    """Create the Notion database and write the selected sample rows.
+    
+    This is the first node that touches the live Notion API. Two distinct
+    operations: database creation (one call, fatal if it fails) and page
+    writes (one call per sample row, isolated failures).
+    """
+    print(f"\n--- SAMPLE WRITE ---")
+
+    # 1. Create the database.
+    db_id, db_error = create_notion_database(
+        parent_page_id=state["target_notion_parent_id"],
+        schema=state["post_edit_schema"],
+        run_id=state["run_id"],
+    )
+
+    if db_id is None:
+        # Schema-level failure. No database, no pages, nothing to do.
+        print(f"\nDatabase creation failed: {db_error}")
+        state["rejection_return_stage"] = "human_checkpoint_1"
+        return state
+
+    state["notion_database_id"] = db_id
+    print(f"\nCreated Notion database: {db_id}")
+
+    # 2. Load CSV so we can pull the actual values for each selected sample row.
+    with open(state["source_csv_path"], "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    header = rows[0]
+    data_rows = rows[1:]
+    col_index_by_name = {name: i for i, name in enumerate(header)}
+
+    # 3. Write each sample row as a page.
+    outcomes: list[RowOutcome] = []
+    for sample in state["sample_selection"]:
+        row_index = sample["row_index"]
+        # data_rows is 0-indexed; row_index in state is 1-indexed (row 2 = first data row)
+        raw_row = data_rows[row_index - 2]
+
+        outcome = write_notion_page(
+            database_id=db_id,
+            schema=state["post_edit_schema"],
+            mapping=state["post_edit_mapping"],
+            raw_row=raw_row,
+            col_index_by_name=col_index_by_name,
+            row_index=row_index,
+        )
+        outcomes.append(outcome)
+        status = "ok" if outcome["success"] else "FAIL"
+        print(f"  Row {row_index}: [{status}] {outcome.get('notion_url') or outcome.get('error_message')}")
+
+    state["sample_row_outcomes"] = outcomes
+    return state
+
+
+def create_notion_database(
+    parent_page_id: str,
+    schema: list[NotionProperty],
+    run_id: str,
+) -> tuple[str | None, str | None]:
+    """Create a Notion database under the given parent page.
+    
+    Returns (database_id, None) on success or (None, error_message) on failure.
+    """
+    notion_schema = build_notion_schema(schema)
+
+    try:
+        response = notion.databases.create(
+            parent={"type": "page_id", "page_id": parent_page_id},
+            title=[{
+                "type": "text",
+                "text": {"content": f"Migration {run_id[:8]}"},
+            }],
+            properties=notion_schema,
+        )
+        return response["id"], None
+
+    except APIResponseError as e:
+        # Notion rejected the request — usually schema-level (invalid type, missing title, etc.)
+        return None, f"Notion API error: {e.code} — {str(e)}"
+    except RequestTimeoutError:
+        return None, "Request timed out while creating database"
+    except HTTPResponseError as e:
+        return None, f"HTTP error: {e}"
+    except Exception as e:
+        # Catch-all so unexpected errors don't crash the pipeline.
+        return None, f"Unexpected error creating database: {type(e).__name__}: {e}"
+
+
+def build_notion_schema(schema: list[NotionProperty]) -> dict[str, dict]:
+    """Translate our internal NotionProperty list into Notion's API schema format."""
+    notion_schema: dict[str, dict] = {}
+    title_assigned = False
+
+    for prop in schema:
+        prop_type = prop["type"]
+        prop_name = prop["name"]
+
+        if prop_type == "title":
+            notion_schema[prop_name] = {"title": {}}
+            title_assigned = True
+        elif prop_type == "rich_text":
+            notion_schema[prop_name] = {"rich_text": {}}
+        elif prop_type == "select":
+            options_list = [{"name": opt} for opt in (prop["options"] or [])]
+            notion_schema[prop_name] = {"select": {"options": options_list}}
+        elif prop_type == "multi_select":
+            options_list = [{"name": opt} for opt in (prop["options"] or [])]
+            notion_schema[prop_name] = {"multi_select": {"options": options_list}}
+        elif prop_type == "date":
+            notion_schema[prop_name] = {"date": {}}
+        elif prop_type == "number":
+            notion_schema[prop_name] = {"number": {"format": "number"}}
+        elif prop_type == "checkbox":
+            notion_schema[prop_name] = {"checkbox": {}}
+        elif prop_type == "email":
+            notion_schema[prop_name] = {"email": {}}
+        elif prop_type == "url":
+            notion_schema[prop_name] = {"url": {}}
+        elif prop_type == "phone_number":
+            notion_schema[prop_name] = {"phone_number": {}}
+        else:
+            # Unknown type — fall back to rich_text so the database can still be created.
+            # The coercion preview should have caught this earlier.
+            notion_schema[prop_name] = {"rich_text": {}}
+
+    # Notion requires exactly one title property. If we didn't assign one,
+    # promote the first property to title. (The schema review should have caught
+    # this; this is defensive.)
+    if not title_assigned and schema:
+        first_name = schema[0]["name"]
+        notion_schema[first_name] = {"title": {}}
+
+    return notion_schema
+
+
+def write_notion_page(
+    database_id: str,
+    schema: list[NotionProperty],
+    mapping: list[MappingEntry],
+    raw_row: list[str],
+    col_index_by_name: dict[str, int],
+    row_index: int,
+) -> RowOutcome:
+    """Write a single Notion page from one CSV row."""
+    try:
+        properties = build_page_properties(schema, mapping, raw_row, col_index_by_name)
+    except Exception as e:
+        return {
+            "row_index": row_index,
+            "success": False,
+            "notion_url": None,
+            "error_message": f"Failed to build page properties: {type(e).__name__}: {e}",
+        }
+
+    try:
+        response = notion.pages.create(
+            parent={"database_id": database_id},
+            properties=properties,
+        )
+        return {
+            "row_index": row_index,
+            "success": True,
+            "notion_url": response.get("url"),
+            "error_message": None,
+        }
+
+    except APIResponseError as e:
+        return {
+            "row_index": row_index,
+            "success": False,
+            "notion_url": None,
+            "error_message": f"Notion API error: {e.code} — {str(e)}",
+        }
+    except RequestTimeoutError:
+        return {
+            "row_index": row_index,
+            "success": False,
+            "notion_url": None,
+            "error_message": "Request timed out while creating page",
+        }
+    except HTTPResponseError as e:
+        return {
+            "row_index": row_index,
+            "success": False,
+            "notion_url": None,
+            "error_message": f"HTTP error: {e}",
+        }
+    except Exception as e:
+        return {
+            "row_index": row_index,
+            "success": False,
+            "notion_url": None,
+            "error_message": f"Unexpected error: {type(e).__name__}: {e}",
+        }
+
+
+def build_page_properties(
+    schema: list[NotionProperty],
+    mapping: list[MappingEntry],
+    raw_row: list[str],
+    col_index_by_name: dict[str, int],
+) -> dict[str, dict]:
+    """Build the Notion page properties payload for one row."""
+    page_properties: dict[str, dict] = {}
+
+    # Index schema by property name for quick lookup.
+    schema_by_name = {p["name"]: p for p in schema}
+
+    for mapping_entry in mapping:
+        csv_column = mapping_entry["csv_column"]
+        property_name = mapping_entry["notion_property"]
+
+        prop = schema_by_name.get(property_name)
+        if prop is None:
+            continue  # mapping points at nonexistent property; skip
+        col_idx = col_index_by_name.get(csv_column)
+        if col_idx is None:
+            continue  # mapping points at nonexistent column; skip
+
+        raw_value = raw_row[col_idx]
+        prop_type = prop["type"]
+        prop_options = prop.get("options")
+
+        page_value = build_property_value(raw_value, prop_type, prop_options)
+        if page_value is not None:
+            page_properties[property_name] = page_value
+
+    return page_properties
+
+
+def build_property_value(
+    raw_value: str,
+    prop_type: str,
+    options: list[str] | None,
+) -> dict | None:
+    """Convert a raw CSV value to Notion's property-value payload shape.
+    
+    Returns None for empty values on optional property types (Notion treats absence
+    as empty). Returns a typed payload otherwise.
+    """
+    v = raw_value.strip()
+
+    if not v and prop_type != "title":
+        # Empty optional value — omit the property entirely.
+        return None
+
+    if prop_type == "title":
+        return {"title": [{"text": {"content": v}}]}
+
+    if prop_type == "rich_text":
+        return {"rich_text": [{"text": {"content": v}}]}
+
+    if prop_type == "select":
+        if options is not None and v in options:
+            return {"select": {"name": v}}
+        return None  # not in options; coercion preview should have caught this
+
+    if prop_type == "multi_select":
+        if options is None:
+            return None
+        items = [item.strip() for item in v.split(",") if item.strip() in options]
+        if not items:
+            return None
+        return {"multi_select": [{"name": item} for item in items]}
+
+    if prop_type == "date":
+        try:
+            parsed = parse_date(v)
+            return {"date": {"start": parsed.strftime("%Y-%m-%d")}}
+        except (ValueError, TypeError):
+            return None
+
+    if prop_type == "number":
+        try:
+            return {"number": float(v)}
+        except ValueError:
+            return None
+
+    if prop_type == "checkbox":
+        if v.lower() in {"true", "yes", "y", "1"}:
+            return {"checkbox": True}
+        if v.lower() in {"false", "no", "n", "0"}:
+            return {"checkbox": False}
+        return None
+
+    if prop_type == "email":
+        return {"email": v}
+
+    if prop_type == "url":
+        return {"url": v}
+
+    if prop_type == "phone_number":
+        return {"phone_number": v}
+
+    return None
+
 if __name__ == "__main__":
     state = init_state(
         csv_path="Test Files/stress_test_2.csv",
@@ -1173,7 +1477,9 @@ if __name__ == "__main__":
                 print(f"\nRun halted at: {state['rejection_return_stage']}.")
             else:
                 state = sample_selection_node(state)
+                state = sample_write_node(state)
 
-                print("\nSample selection (state):")
+                print("\nSample row outcomes:")
                 from pprint import pp
-                pp(state["sample_selection"])
+                pp(state["sample_row_outcomes"])
+                print(f"\nNotion database ID: {state['notion_database_id']}")
