@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import shlex
 from notion_client import Client as NotionClient
 from notion_client.errors import APIResponseError, RequestTimeoutError, HTTPResponseError
-
+import requests
 
 load_dotenv()
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -1452,6 +1452,140 @@ def build_property_value(
 
     return None
 
+def in_situ_checkpoint_node(state: MigrationState) -> MigrationState:
+    """Second human checkpoint. Human reviews real Notion pages and decides
+    whether to proceed to bulk write or rewind."""
+    print(f"\n--- HUMAN CHECKPOINT 2 (IN-SITU REVIEW) ---")
+
+    print_in_situ_context(state)
+    print_checkpoint_2_help()
+
+    while True:
+        try:
+            raw_input_str = input("\n> ").strip()
+        except EOFError:
+            print("Input stream closed. Aborting.")
+            state["rejection_return_stage"] = "human_checkpoint_2"
+            return state
+
+        if not raw_input_str:
+            continue
+
+        command = raw_input_str.split()[0].lower()
+
+        if command in {"enter", "approve"}:
+            print("Approved. Proceeding to bulk write.")
+            return state
+
+        elif command == "abort":
+            print("Aborting run.")
+            if confirm_delete_samples():
+                delete_sample_database(state)
+            state["rejection_return_stage"] = "human_checkpoint_2"
+            return state
+
+        elif command == "reject_to_schema":
+            print("Rewinding to checkpoint 1 (schema edit).")
+            if confirm_delete_samples():
+                delete_sample_database(state)
+            state["rejection_return_stage"] = "human_checkpoint_1"
+            return state
+
+        elif command == "reject_to_sampling":
+            print("Rewinding to sample selection.")
+            if confirm_delete_samples():
+                delete_sample_database(state)
+            state["rejection_return_stage"] = "sample_selection"
+            return state
+
+        elif command == "help":
+            print_checkpoint_2_help()
+
+        else:
+            print(f"Unknown command: {command!r}. Type 'help' for a list.")
+
+
+def print_in_situ_context(state: MigrationState) -> None:
+    """Show the human the sample URLs and what each one is."""
+    db_id = state.get("notion_database_id")
+    print(f"\nSample database: {db_id}")
+    print(
+        "\nReview the rendered pages in Notion. Compare what you see against\n"
+        "the original CSV — confirm the data looks right, the schema renders\n"
+        "the way you expect, and there are no surprises.\n"
+    )
+    print("Samples written:")
+
+    # Cross-reference sample_selection (reasons) with sample_row_outcomes (URLs).
+    selection_by_row = {s["row_index"]: s for s in state["sample_selection"]}
+    for outcome in state["sample_row_outcomes"]:
+        row_idx = outcome["row_index"]
+        sel = selection_by_row.get(row_idx)
+        reason = sel["selection_reason"] if sel else "(unknown reason)"
+        status = "ok" if outcome["success"] else "FAIL"
+
+        print(f"\n  Row {row_idx} [{status}]: {reason}")
+        if outcome["success"] and outcome["notion_url"]:
+            print(f"    → {outcome['notion_url']}")
+        elif outcome["error_message"]:
+            print(f"    error: {outcome['error_message']}")
+
+
+def print_checkpoint_2_help() -> None:
+    print("""
+Available commands:
+  enter / approve          — sample looks good; proceed to bulk write
+  reject_to_schema         — sample reveals schema issues; rewind to checkpoint 1
+  reject_to_sampling       — schema is fine but want different sample rows
+  abort                    — kill the run entirely
+  help                     — print this list
+""")
+
+
+def confirm_delete_samples() -> bool:
+    """Ask the human whether to delete the sample database after rejection."""
+    while True:
+        answer = input(
+            "\nDelete the sample database (and its pages) before rewinding? "
+            "[Y/n] "
+        ).strip().lower()
+        if answer in {"", "y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def delete_sample_database(state: MigrationState) -> None:
+    """Archive the sample Notion database via raw HTTP.
+    
+    The SDK 2.2.1 silently filters the `archived` parameter out of databases.update,
+    so we bypass the SDK for this specific call and PATCH the raw endpoint directly.
+    Verified working via test_archive.py.
+    """
+    db_id = state.get("notion_database_id")
+    if not db_id:
+        return
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {os.getenv('NOTION_API_KEY')}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+        response = requests.patch(
+            f"https://api.notion.com/v1/databases/{db_id}",
+            headers=headers,
+            json={"archived": True},
+        )
+        response.raise_for_status()
+        print(f"Archived sample database {db_id}.")
+    except Exception as e:
+        print(f"Couldn't archive database (will continue anyway): {type(e).__name__}: {e}")
+
+    state["notion_database_id"] = None
+    state["sample_row_outcomes"] = []
+
 if __name__ == "__main__":
     state = init_state(
         csv_path="Test Files/stress_test_2.csv",
@@ -1479,7 +1613,16 @@ if __name__ == "__main__":
                 state = sample_selection_node(state)
                 state = sample_write_node(state)
 
-                print("\nSample row outcomes:")
-                from pprint import pp
-                pp(state["sample_row_outcomes"])
-                print(f"\nNotion database ID: {state['notion_database_id']}")
+                if state["rejection_return_stage"] is not None:
+                    print(f"\nRun halted at: {state['rejection_return_stage']}.")
+                else:
+                    state = in_situ_checkpoint_node(state)
+
+                    if state["rejection_return_stage"] is not None:
+                        print(f"\nRun halted at: {state['rejection_return_stage']}.")
+                    else:
+                        print("\nReady for bulk write (next node).")
+                        print(f"Database: {state['notion_database_id']}")
+                        from pprint import pp
+                        print("\nSample outcomes:")
+                        pp(state["sample_row_outcomes"])
