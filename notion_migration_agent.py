@@ -63,7 +63,8 @@ class ColumnCoercionResult(TypedDict):
     target_type: str
     success_count: int
     failure_count: int
-    failure_examples: list[CoercionFailure]  # was list[str]
+    failure_examples: list[CoercionFailure]
+    warning_examples: list[CoercionFailure]   # succeeded, but worth human attention
 
 
 class SampleSelection(TypedDict):
@@ -268,7 +269,7 @@ def profile_column(col_name: str, values: list[str]) -> ColumnProfile:
 
     # 6. Example row indices (first 5 non-null rows)
     example_rows = [
-        i for i, v in enumerate(values, start=1) if v.strip() != ""
+        i for i, v in enumerate(values, start=2) if v.strip() != ""
     ][:5]
 
     return {
@@ -868,20 +869,19 @@ def coerce_column(
     success_count = 0
     failure_count = 0
     failures: list[CoercionFailure] = []
+    warnings: list[CoercionFailure] = []
 
     for i, raw_value in enumerate(column_values, start=2):  # row 1 is header
         # Empty cells aren't failures — Notion accepts empty values for most types.
         # Title is the exception (handled below).
         if not raw_value.strip():
-            if target_type == "title":
-                failures.append({
+            success_count += 1
+            if target_type == "title" and len(warnings) < 10:
+                warnings.append({
                     "row_index": i,
                     "value": raw_value,
-                    "reason": "title cannot be empty",
+                    "reason": "empty title — Notion accepts this and will render an 'Untitled' page",
                 })
-                failure_count += 1
-            else:
-                success_count += 1
             continue
 
         ok, reason = try_coerce_value(raw_value, target_type, options)
@@ -903,6 +903,7 @@ def coerce_column(
         "success_count": success_count,
         "failure_count": failure_count,
         "failure_examples": failures,
+        "warning_examples": warnings,
     }
 
 
@@ -1006,6 +1007,12 @@ def print_coercion_report(report: list[ColumnCoercionResult]) -> None:
         )
         for fail in result["failure_examples"][:5]:  # show up to 5 examples per column
             print(f"    row {fail['row_index']}: {fail['value']!r} — {fail['reason']}")
+
+        if result["warning_examples"]:
+            print(f"    warnings ({len(result['warning_examples'])} shown, capped at 10):")
+            for warn in result["warning_examples"][:5]:
+                print(f"      row {warn['row_index']}: {warn['reason']}")
+
         if len(result["failure_examples"]) > 5:
             print(f"    ... and {len(result['failure_examples']) - 5} more")
 
@@ -1724,7 +1731,7 @@ def print_bulk_summary(
 
 if __name__ == "__main__":
     state = init_state(
-        csv_path="Test Files/stress_test_2.csv",
+        csv_path="Test Files/stress_test_3.csv",
         parent_id="34cb6cf3b46980c9ab00d8896467fa30",
     )
     state = structural_validation_node(state)
