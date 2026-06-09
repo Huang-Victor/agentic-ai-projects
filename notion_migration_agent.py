@@ -1586,6 +1586,142 @@ def delete_sample_database(state: MigrationState) -> None:
     state["notion_database_id"] = None
     state["sample_row_outcomes"] = []
 
+    # Bulk write thresholds — production would make these configuration, FDE-tunable per deployment.
+BULK_FAILURE_RATE_THRESHOLD = 0.05         # halt if >5% of attempted rows fail
+BULK_CONSECUTIVE_FAILURE_THRESHOLD = 10    # halt if this many fail in a row
+BULK_MIN_ATTEMPTS_BEFORE_RATE_CHECK = 20   # rate check is meaningless on tiny samples
+
+
+def bulk_write_node(state: MigrationState) -> MigrationState:
+    """Write all remaining (non-sample) rows to the Notion database.
+    
+    Skip-and-continue is the default behavior. Halts and surfaces the run for
+    human review if failure patterns suggest systematic issues — either the
+    overall failure rate exceeds the threshold or N consecutive rows fail.
+    """
+    print(f"\n--- BULK WRITE ---")
+
+    db_id = state["notion_database_id"]
+    if db_id is None:
+        # Should never happen if sample write succeeded, but defensive guard.
+        print("No database ID in state. Skipping bulk write.")
+        state["rejection_return_stage"] = "sample_write"
+        return state
+
+    # Load CSV.
+    with open(state["source_csv_path"], "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    header = rows[0]
+    data_rows = rows[1:]
+    col_index_by_name = {name: i for i, name in enumerate(header)}
+
+    # Rows already written by sample_write — skip these.
+    sample_indices = {o["row_index"] for o in state["sample_row_outcomes"]}
+
+    outcomes: list[RowOutcome] = []
+    consecutive_failures = 0
+    halt_reason: str | None = None
+
+    total_rows_to_write = len(data_rows) - len(sample_indices)
+    print(f"Writing {total_rows_to_write} rows ({len(data_rows)} total, {len(sample_indices)} already in sample)")
+
+    for i, raw_row in enumerate(data_rows, start=2):  # row 1 is header
+        if i in sample_indices:
+            continue  # already written as part of the sample
+
+        outcome = write_notion_page(
+            database_id=db_id,
+            schema=state["post_edit_schema"],
+            mapping=state["post_edit_mapping"],
+            raw_row=raw_row,
+            col_index_by_name=col_index_by_name,
+            row_index=i,
+        )
+        outcomes.append(outcome)
+
+        # Progress indicator — every 10 rows for small CSVs, every 50 for large.
+        progress_interval = 10 if total_rows_to_write < 100 else 50
+        if len(outcomes) % progress_interval == 0:
+            successes = sum(1 for o in outcomes if o["success"])
+            print(f"  Progress: {len(outcomes)}/{total_rows_to_write} attempted, {successes} succeeded")
+
+        # Track consecutive failures.
+        if outcome["success"]:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+
+        # Halt condition 1: too many consecutive failures.
+        if consecutive_failures >= BULK_CONSECUTIVE_FAILURE_THRESHOLD:
+            halt_reason = (
+                f"halted after {consecutive_failures} consecutive failures "
+                f"(threshold: {BULK_CONSECUTIVE_FAILURE_THRESHOLD}) — "
+                "likely systematic issue"
+            )
+            break
+
+        # Halt condition 2: overall failure rate exceeds threshold.
+        # Only check after we have enough data for the rate to be meaningful.
+        if len(outcomes) >= BULK_MIN_ATTEMPTS_BEFORE_RATE_CHECK:
+            failure_count = sum(1 for o in outcomes if not o["success"])
+            failure_rate = failure_count / len(outcomes)
+            if failure_rate > BULK_FAILURE_RATE_THRESHOLD:
+                halt_reason = (
+                    f"halted at {len(outcomes)} attempts with "
+                    f"{failure_rate*100:.1f}% failure rate "
+                    f"(threshold: {BULK_FAILURE_RATE_THRESHOLD*100:.0f}%)"
+                )
+                break
+
+    state["bulk_row_outcomes"] = outcomes
+    print_bulk_summary(outcomes, total_rows_to_write, halt_reason)
+
+    if halt_reason is not None:
+        # Store the halt reason in state for the reconciliation report.
+        # Using a dict assignment because we didn't define a typed field for it —
+        # keep it simple for the learning project.
+        state["bulk_write_halt_reason"] = halt_reason
+        state["rejection_return_stage"] = "bulk_write"
+
+    return state
+
+
+def print_bulk_summary(
+    outcomes: list[RowOutcome],
+    total_to_write: int,
+    halt_reason: str | None,
+) -> None:
+    """Print a short summary of what bulk write did."""
+    if not outcomes:
+        print("(no rows attempted)")
+        return
+
+    successes = sum(1 for o in outcomes if o["success"])
+    failures = len(outcomes) - successes
+
+    print(f"\nBulk write summary:")
+    print(f"  Attempted: {len(outcomes)} of {total_to_write}")
+    print(f"  Succeeded: {successes}")
+    print(f"  Failed:    {failures}")
+
+    if halt_reason:
+        print(f"\nHALT: {halt_reason}")
+        if total_to_write - len(outcomes) > 0:
+            print(f"  {total_to_write - len(outcomes)} rows were not attempted.")
+
+    if failures > 0:
+        print(f"\nFirst few failures:")
+        shown = 0
+        for outcome in outcomes:
+            if not outcome["success"]:
+                print(f"  row {outcome['row_index']}: {outcome['error_message']}")
+                shown += 1
+                if shown >= 5:
+                    break
+        if failures > 5:
+            print(f"  ... and {failures - 5} more")
+
 if __name__ == "__main__":
     state = init_state(
         csv_path="Test Files/stress_test_2.csv",
@@ -1621,8 +1757,13 @@ if __name__ == "__main__":
                     if state["rejection_return_stage"] is not None:
                         print(f"\nRun halted at: {state['rejection_return_stage']}.")
                     else:
-                        print("\nReady for bulk write (next node).")
-                        print(f"Database: {state['notion_database_id']}")
-                        from pprint import pp
-                        print("\nSample outcomes:")
-                        pp(state["sample_row_outcomes"])
+                        state = bulk_write_node(state)
+
+                        if state["rejection_return_stage"] is not None:
+                            print(f"\nRun halted at: {state['rejection_return_stage']}.")
+                            if state.get("bulk_write_halt_reason"):
+                                print(f"  Reason: {state['bulk_write_halt_reason']}")
+                        else:
+                            print("\nBulk write complete. Ready for reconciliation (next node).")
+                            from pprint import pp
+                            print(f"\nBulk row outcomes: {len(state['bulk_row_outcomes'])} entries")
