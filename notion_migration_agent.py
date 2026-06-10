@@ -86,6 +86,7 @@ class ReconciliationReport(TypedDict):
     failure_patterns: list[str]
     suggested_fixes: list[str]
     failed_row_indices: list[int]
+    unattempted_row_indices: list[int]   # new — rows never attempted (e.g., after a halt)
 
 
 class CoercionFailure(TypedDict):
@@ -1729,6 +1730,104 @@ def print_bulk_summary(
         if failures > 5:
             print(f"  ... and {failures - 5} more")
 
+def reconciliation_node(state: MigrationState) -> MigrationState:
+    """Aggregate all write outcomes into the final report: counts, failure
+    patterns, suggested fixes, and the row indices a retry pass would need.
+    
+    Runs whether bulk write completed or halted — this report is the
+    diagnostic for both outcomes.
+    """
+    print(f"\n--- RECONCILIATION ---")
+
+    # Load CSV to establish the full row universe.
+    with open(state["source_csv_path"], "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    data_row_count = len(rows) - 1
+    all_indices = set(range(2, data_row_count + 2))  # data rows are 2..N+1
+
+    all_outcomes = state["sample_row_outcomes"] + state["bulk_row_outcomes"]
+    attempted_indices = {o["row_index"] for o in all_outcomes}
+
+    failed = [o for o in all_outcomes if not o["success"]]
+    succeeded_count = len(all_outcomes) - len(failed)
+    unattempted = sorted(all_indices - attempted_indices)
+
+    # Pattern detection: group failures by identical error message.
+    failures_by_message: dict[str, list[int]] = {}
+    for o in failed:
+        msg = o["error_message"] or "(no error message)"
+        failures_by_message.setdefault(msg, []).append(o["row_index"])
+
+    failure_patterns: list[str] = []
+    suggested_fixes: list[str] = []
+    for msg, indices in sorted(failures_by_message.items(), key=lambda kv: -len(kv[1])):
+        shown = indices[:10]
+        suffix = f" (+{len(indices) - 10} more)" if len(indices) > 10 else ""
+        failure_patterns.append(f"{len(indices)} row(s): {msg} — rows {shown}{suffix}")
+        suggested_fixes.append(suggest_fix_for_error(msg))
+
+    halt_reason = state.get("bulk_write_halt_reason")
+    if halt_reason:
+        failure_patterns.append(f"Run halted early: {halt_reason}")
+        suggested_fixes.append(
+            "Investigate the systematic issue, then re-run against the failed and unattempted rows."
+        )
+
+    report: ReconciliationReport = {
+        "total_rows": data_row_count,
+        "succeeded": succeeded_count,
+        "failed": len(failed),
+        "failure_patterns": failure_patterns,
+        "suggested_fixes": suggested_fixes,
+        "failed_row_indices": sorted(o["row_index"] for o in failed),
+        "unattempted_row_indices": unattempted,
+    }
+    state["reconciliation_report"] = report
+    print_reconciliation_report(report)
+    return state
+
+
+def suggest_fix_for_error(error_message: str) -> str:
+    """Map an error message to an actionable fix, by known error category."""
+    msg = error_message.lower()
+    if "not in defined options" in msg:
+        return "Add the value as a select option at checkpoint 1, or normalize the source value to an existing option."
+    if "timed out" in msg or "http error" in msg:
+        return "Transient infrastructure issue — retry these rows without any changes."
+    if "date" in msg:
+        return "Fix the date format in the source CSV for these rows, then retry."
+    if "title" in msg:
+        return "Provide a value for the title column in the source CSV for these rows."
+    return "Inspect the source row against the error message, correct the data, and retry."
+
+
+def print_reconciliation_report(report: ReconciliationReport) -> None:
+    """Human-readable final report."""
+    attempted = report["succeeded"] + report["failed"]
+    print(f"\nMigration reconciliation:")
+    print(f"  Total source rows: {report['total_rows']}")
+    print(f"  Attempted:         {attempted}")
+    print(f"  Succeeded:         {report['succeeded']}")
+    print(f"  Failed:            {report['failed']}")
+    print(f"  Unattempted:       {len(report['unattempted_row_indices'])}")
+
+    if report["total_rows"] > 0:
+        rate = report["succeeded"] / report["total_rows"]
+        print(f"  Completion:        {rate*100:.1f}%")
+
+    if report["failure_patterns"]:
+        print(f"\nFailure patterns:")
+        for pattern, fix in zip(report["failure_patterns"], report["suggested_fixes"]):
+            print(f"  - {pattern}")
+            print(f"    fix: {fix}")
+
+    retry_set = sorted(set(report["failed_row_indices"]) | set(report["unattempted_row_indices"]))
+    if retry_set:
+        print(f"\nRetry seed — rows for the next pass: {retry_set}")
+    else:
+        print(f"\nMigration converged: every source row written successfully.")
+
 if __name__ == "__main__":
     state = init_state(
         csv_path="Test Files/stress_test_3.csv",
@@ -1764,13 +1863,16 @@ if __name__ == "__main__":
                     if state["rejection_return_stage"] is not None:
                         print(f"\nRun halted at: {state['rejection_return_stage']}.")
                     else:
+                        
                         state = bulk_write_node(state)
+
+                        # Reconciliation runs unconditionally — it is the
+                        # diagnostic for both completion and halt.
+                        state = reconciliation_node(state)
 
                         if state["rejection_return_stage"] is not None:
                             print(f"\nRun halted at: {state['rejection_return_stage']}.")
                             if state.get("bulk_write_halt_reason"):
                                 print(f"  Reason: {state['bulk_write_halt_reason']}")
                         else:
-                            print("\nBulk write complete. Ready for reconciliation (next node).")
-                            from pprint import pp
-                            print(f"\nBulk row outcomes: {len(state['bulk_row_outcomes'])} entries")
+                            print("\nMigration complete.")
